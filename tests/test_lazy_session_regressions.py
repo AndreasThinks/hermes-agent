@@ -606,3 +606,25 @@ class TestFinalizeOrphanedCompressionSessions:
 
         session = db.get_session("titled-ghost")
         assert session["end_reason"] == "orphaned_compression"
+
+
+# ===========================================================================
+# Gateway synthetic notes must not pollute memory recall
+# ===========================================================================
+
+class TestGatewaySyntheticNotesPersistence:
+    """Gateway prepends operational notes to the API prompt, but memory
+    recall and transcript persistence need the clean human message."""
+
+    def test_prompt_submit_passes_clean_user_message_as_persist_override(self):
+        """Regression guard for model-switch notes like 'llama-swap'.
+
+        If these synthetic notes reach persist_user_message, Mnemosyne uses
+        them as the recall query and retrieves unrelated local-model memories.
+        """
+        from pathlib import Path
+
+        src = Path("gateway/run.py").read_text()
+
+        assert "_clean_user_message_for_persistence = message" in src
+        assert "persist_user_message=_clean_user_message_for_persistence" in src

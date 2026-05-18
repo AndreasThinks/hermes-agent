@@ -15716,6 +15716,12 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
 
+            # Keep the human-authored turn separate from API-only gateway notes.
+            # Mnemosyne and transcript persistence use this clean copy as their
+            # recall/persistence surface; otherwise model-switch notes like
+            # "llama-swap" can pollute memory retrieval for the actual turn.
+            _clean_user_message_for_persistence = message
+
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
             _msn = _pending_notes.pop(session_key, None) if session_key else None
@@ -15840,7 +15846,12 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
-                result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                result = agent.run_conversation(
+                    _run_message,
+                    conversation_history=agent_history,
+                    task_id=session_id,
+                    persist_user_message=_clean_user_message_for_persistence,
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
