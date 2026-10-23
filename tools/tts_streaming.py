@@ -342,6 +342,23 @@ class GeminiStreamer(StreamingTTSProvider):
         base_url = normalize_gemini_base_url(
             self.section.get("base_url") or get_env_value("GEMINI_BASE_URL") or DEFAULT_GEMINI_TTS_BASE_URL,
         )
+        if voice.startswith("voice_"):
+            # Interactions returns a complete WAV. Preserve the selected voice with
+            # buffered per-sentence PCM instead of sending its ID as a prebuilt voice.
+            import io
+            import wave
+            from tools.tts_tool_providers import _request_gemini_designed_voice
+            wav = _request_gemini_designed_voice(
+                text, model, voice, base_url, {"x-goog-api-key": api_key})
+            with wave.open(io.BytesIO(wav), "rb") as audio:
+                if audio.getnchannels() != 1 or audio.getsampwidth() != 2:
+                    raise RuntimeError("Gemini TTS designed voice requires mono 16-bit PCM")
+                self.sample_rate = audio.getframerate()
+                def _pcm_chunks():
+                    while chunk := audio.readframes(4096):
+                        yield chunk
+                yield from _capped(_pcm_chunks(), "Gemini designed voice TTS")
+            return
         payload = {
             "contents": [{"parts": [{"text": text}]}],
             "generationConfig": {

@@ -1920,6 +1920,8 @@ class GatewayTurnMixin:
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         if diagnostic_wake_muted(event):
             return None
+        # Event-local receipt survives profile teardown before base-adapter TTS.
+        event._reply_audio_owner = agent_result.get("_reply_audio_owner")
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
@@ -3604,26 +3606,6 @@ class GatewayTurnMixin:
         if _agent.model != _cfg_model and not self._is_intentional_model_switch(session_key, _agent, _cfg_model):
             self._evict_cached_agent(session_key)
 
-    async def _run_agent_finalize_streaming_tts(self, turn_ctx: TurnContext, adapter: Any) -> None:
-        """Finalize the streaming-TTS consumer on the outer event-loop thread (covers early returns
-        from run_sync). On drain timeout abort to free the task — audible streams keep whole-file
-        suppression, silent streams stay eligible for the whole-file fallback."""
-        _stts = turn_ctx.streaming_tts_consumer_holder[0]
-        if _stts is None:
-            return
-        _stts.finish()
-        try:
-            await _stts.wait_complete(timeout=10.0)
-        except Exception as _stts_done_err:
-            logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
-        if not _stts.done:
-            _stts.abort("streaming TTS finalisation timeout")
-            await _stts.wait_complete(timeout=2.0)
-        if _stts.suppress_whole_file and adapter is not None:
-            _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)
-            if callable(_mark_turn):
-                _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
-
     async def _run_agent_drain_pending(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str]
     ) -> tuple[Any, Optional[str]]:
@@ -4350,7 +4332,8 @@ class GatewayTurnMixin:
             # Interrupted OR queued message (/queue)?
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
-            await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
+            from gateway.reply_audio import finalize_streaming_audio
+            await finalize_streaming_audio(turn_ctx, adapter)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(

@@ -370,6 +370,19 @@ _FTS_TRIGGERS = ("messages_fts_insert", "messages_fts_delete", "messages_fts_upd
                  "messages_fts_trigram_insert", "messages_fts_trigram_delete", "messages_fts_trigram_update")
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS reply_audio (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    part INTEGER NOT NULL,
+    mime_type TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    UNIQUE(session_id, message_id, part)
+);
+CREATE INDEX IF NOT EXISTS idx_reply_audio_session ON reply_audio(session_id, message_id);
+
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );

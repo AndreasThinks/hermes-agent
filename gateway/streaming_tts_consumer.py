@@ -14,6 +14,9 @@ import contextlib
 import logging
 import queue
 import threading
+import tempfile
+import wave
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
@@ -48,6 +51,10 @@ class StreamingTTSConsumer:
         self._task: Optional[asyncio.Task] = None  # drain task, created once by start()
         self._completed = self._partial = self._aborted = False
         self._finished = self._dropped = self._suppress_whole_file = False
+        # Anonymous spool survives until the actual assistant row receipt arrives.
+        self._recording = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
+        self._recording_bytes = 0
+        self._recording_overflow = False
         self._lock, self._strip_markdown = threading.Lock(), None  # stripper lazily imported
 
     def _streamer_format(self) -> AudioFormat:
@@ -202,10 +209,49 @@ class StreamingTTSConsumer:
                 continue
             if self._handle is None and not await self._open_handle():
                 raise _HandleDeclined()
+            from hermes_state_audio import MAX_FILE_BYTES
+            if not self._recording_overflow:
+                if self._recording_bytes + len(chunk) > MAX_FILE_BYTES - 44:
+                    self._recording_overflow = True
+                    self._recording.close()
+                else:
+                    try:
+                        self._recording.write(chunk)
+                        self._recording_bytes += len(chunk)
+                    except OSError:
+                        self._recording_overflow = True
+                        self._recording.close()
+                        logger.warning("Streaming reply audio could not be retained")
             was_audible = self._handle.audible
             await self._adapter.write_streaming_tts(self._handle, chunk)
             if not was_audible:
                 self._handle.audible = self._suppress_whole_file = True
+
+    async def retain_audio(self, owner) -> None:
+        """Archive the exact completed PCM stream after final-row persistence, never synthesize."""
+        from gateway.reply_audio import retain_owned_audio
+        if self._recording.closed:
+            return
+        try:
+            if not self.completed or self._recording_overflow or not self._recording_bytes or not owner:
+                return
+            # wave needs a named file for the existing store's file validation/copy path.
+            with tempfile.TemporaryDirectory(prefix="hermes-reply-pcm-") as directory:
+                path = Path(directory) / "reply.wav"
+                def write_wav():
+                    self._recording.seek(0)
+                    with wave.open(str(path), "wb") as output:
+                        output.setnchannels(self._audio_format.channels)
+                        output.setsampwidth(self._audio_format.sample_width)
+                        output.setframerate(self._audio_format.sample_rate)
+                        while chunk := self._recording.read(65536):
+                            output.writeframesraw(chunk)
+                await asyncio.to_thread(write_wav)
+                await retain_owned_audio(owner, [path])
+        except Exception:  # health: allow BLE001 -- optional retention must preserve delivery without private-path logs
+            logger.warning("Streaming reply audio could not be retained")
+        finally:
+            self._recording.close()
 
     async def _safe_abort(self, reason: str) -> None:
         """Abort the adapter stream, swallowing errors (idempotent)."""

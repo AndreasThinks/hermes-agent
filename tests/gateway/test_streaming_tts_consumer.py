@@ -111,30 +111,9 @@ class BlockingSecondChunkStreamer(FakeStreamer):
 
 def _make_consumer(adapter, chat_id, loop, streamer):
     """Build a StreamingTTSConsumer with pre-set internals for testing."""
-    consumer = StreamingTTSConsumer.__new__(StreamingTTSConsumer)
-    consumer._adapter = adapter
-    consumer._chat_id = chat_id
-    consumer._loop = loop
-    consumer._metadata = None
-    consumer._audio_format = AudioFormat(
-        sample_rate=int(getattr(streamer, "sample_rate", 24000)) if streamer is not None else 24000,
-        channels=int(getattr(streamer, "channels", 1)) if streamer is not None else 1,
-        sample_width=int(getattr(streamer, "sample_width", 2)) if streamer is not None else 2,
-    )
-    consumer._streamer = streamer  # type: ignore[assignment]
-    consumer._chunker = SentenceChunker()
-    consumer._queue = queue.Queue(maxsize=256)
-    consumer._handle = None
-    consumer._completed = False
-    consumer._partial = False
-    consumer._aborted = False
-    consumer._finished = False
-    consumer._dropped = False
-    consumer._suppress_whole_file = False
-    consumer._task = None
-    consumer._lock = threading.Lock()
-    consumer._strip_markdown = None
-    return consumer
+    from unittest.mock import patch
+    with patch("tools.tts_streaming.resolve_streaming_provider", return_value=streamer):
+        return StreamingTTSConsumer(adapter, chat_id, {}, loop)
 
 
 def _run_test(coro_factory, timeout=10.0):
@@ -690,3 +669,54 @@ class TestEndpointReportedRate:
             assert len(adapter.written_chunks) == 2
 
         _run_test(run)
+
+
+@pytest.mark.asyncio
+async def test_completed_stream_retains_actual_pcm_on_exact_row(tmp_path, monkeypatch):
+    import wave
+    from hermes_state import SessionDB
+    from hermes_state_audio import message_audio, audio_file
+    monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda _: FakeStreamer(chunks_per_clause=2))
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s", source="discord")
+    row = db.append_message("s", "assistant", "Hello.")
+    adapter = FakeVoiceAdapter()
+    consumer = StreamingTTSConsumer(adapter, "chat", {}, asyncio.get_running_loop())
+    consumer.start()
+    consumer.on_delta("Hello.")
+    consumer.finish()
+    assert await consumer.wait_complete()
+    await consumer.retain_audio({"db_path": str(db.db_path), "session_id": "s", "message_id": row})
+    attachments = message_audio(db, "s", [row])[row]
+    with wave.open(str(audio_file(db, attachments[0]["id"])), "rb") as wav:
+        assert wav.readframes(wav.getnframes()) == b"".join(adapter.written_chunks)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_retained_wav_uses_first_chunk_negotiated_format(tmp_path, monkeypatch):
+    import wave
+    from hermes_state import SessionDB
+    from hermes_state_audio import message_audio, audio_file
+
+    class NegotiatedStreamer(FakeStreamer):
+        def stream(self, text):
+            self.sample_rate = 44100
+            yield b"\x01\x00" * 480
+
+    monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda _: NegotiatedStreamer())
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s", source="discord")
+    row = db.append_message("s", "assistant", "Hello.")
+    consumer = StreamingTTSConsumer(FakeVoiceAdapter(), "chat", {}, asyncio.get_running_loop())
+    consumer.start()
+    consumer.on_delta("Hello.")
+    consumer.finish()
+    assert await consumer.wait_complete()
+    await consumer.retain_audio({"db_path": str(db.db_path), "session_id": "s", "message_id": row})
+    ident = message_audio(db, "s", [row])[row][0]["id"]
+    with wave.open(str(audio_file(db, ident)), "rb") as wav:
+        assert wav.getframerate() == 44100
+        assert wav.readframes(wav.getnframes()) == b"\x01\x00" * 480
+    assert consumer._recording.closed
+    db.close()

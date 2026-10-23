@@ -153,6 +153,11 @@ def test_codex_turn_persists_each_message_exactly_once():
         assistant_row = next(
             row for row in rows if row["content"] == "CODEX_ASSISTANT"
         )
+        assert result["session_id"] == sid
+        assert result["final_message_id"] == assistant_row["id"]
+        from gateway.reply_audio import bind_reply_audio
+        bind_reply_audio(result, agent)
+        assert result["_reply_audio_owner"]["message_id"] == assistant_row["id"]
         assert isinstance(assistant_row["timestamp"], float)
         # session_search can now see the codex conversation.
         hits = {r["session_id"] for r in db.search_messages("CODEX_ASSISTANT")}

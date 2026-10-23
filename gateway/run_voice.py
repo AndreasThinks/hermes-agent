@@ -426,6 +426,8 @@ class GatewayVoiceMixin:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
             actual_paths = paths
+            from gateway.reply_audio import retain_event_audio
+            await retain_event_audio(event, actual_paths)
             await self._deliver_voice_reply(event, actual_paths)
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)

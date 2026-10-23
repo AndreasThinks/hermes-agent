@@ -479,3 +479,27 @@ def test_hard_failure_exit_reasons_still_fail_the_turn(monkeypatch):
     result = _finalize(FakeAgent(), exit_reason="repeated_outer_errors(RuntimeError)", final_response="stopped")
     assert result["failed"] is True and result["completed"] is False
     assert result["failure_reason"] == "loop_error" and result["error"] == "stopped"
+
+
+def test_final_reply_receipt_is_not_latest_database_row(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+    from gateway.reply_audio import bind_reply_audio
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("sess-test", source="telegram")
+    agent = FakeAgent()
+    agent._session_db = db
+    messages = [{"role": "user", "content": "capture"}, {"role": "assistant", "content": "answer"}]
+    def persist(rows, _history):
+        db.append_messages_batch("sess-test", rows)
+        db.append_message("sess-test", "user", "intervening")
+        db.append_message("sess-test", "assistant", "unrelated")
+    agent._persist_session = persist
+    result = finalize_turn(agent, final_response="answer", api_call_count=1, interrupted=False, failed=False,
+        messages=messages, conversation_history=[], effective_task_id="task", turn_id="turn", user_message="capture",
+        original_user_message="capture", _should_review_memory=False, _turn_exit_reason="completed")
+    assert result["final_message_id"] == messages[1]["_row_id"]
+    assert result["final_message_id"] != db.get_messages("sess-test")[-1]["id"]
+    bind_reply_audio(result, agent)
+    assert result["_reply_audio_owner"]["message_id"] == messages[1]["_row_id"]
+    db.close()

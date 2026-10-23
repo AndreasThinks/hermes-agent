@@ -617,8 +617,10 @@ def finalize_turn(
     # stream-recovered ``final_response`` is rebound the moment it is computed — BEFORE
     # the fallible tail-shaping / override / micro-compaction / persist calls — so a
     # raise in any of them can't drop text the user already saw (#95514, #8049).
+    final_message = None
+
     def _persist_step():
-        nonlocal final_response
+        nonlocal final_response, final_message
         _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
@@ -632,6 +634,10 @@ def finalize_turn(
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
+        # Capture the turn-owned object; persistence stamps its durable row receipt.
+        tail = messages[-1] if messages else None
+        if tail and tail.get("role") == "assistant" and not tail.get("tool_calls"):
+            final_message = tail
         agent._persist_session(messages, conversation_history)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
@@ -686,6 +692,7 @@ def finalize_turn(
 
     result = {
         "final_response": final_response,
+        "final_message_id": final_message.get("_row_id") if final_message else None,
         "last_reasoning": _last_turn_reasoning(messages),
         "messages": messages,
         "api_calls": api_call_count,

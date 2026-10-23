@@ -72,6 +72,11 @@ class GatewaySessionWatchersMixin:
                     logger.info("SessionStore prune: dropped %d stale entries", n)
             except Exception as e:
                 logger.debug("SessionStore prune failed: %s", e)
+            try:
+                from hermes_state_audio import prune_live_reply_audio
+                await asyncio.to_thread(prune_live_reply_audio)
+            except Exception:  # health: allow BLE001 -- housekeeping must continue; do not log private paths
+                logger.warning("Automatic reply audio cleanup failed")
             self._last_session_store_prune_ts = time.time()
 
     def _session_stall_timeout_seconds(self) -> float:

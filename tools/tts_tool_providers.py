@@ -556,6 +556,37 @@ def _gemini_error_detail(response: Any) -> str:
     return message or raw_body.decode("utf-8", errors="replace")[:300]
 
 
+def _request_gemini_designed_voice(
+    text: str, model: str, voice: str, base_url: str, headers: dict[str, str],
+) -> bytes:
+    """Stored voice IDs use Interactions and return an encoded WAV, not raw PCM."""
+    payload = {
+        "model": model,
+        "input": [{"type": "user_input", "content": [{"type": "text", "text": text}]}],
+        "response_format": {"type": "audio"},
+        "generation_config": {"speech_config": [{"voice": voice}]},
+    }
+    response = _post_json(f"{base_url}/interactions", payload, headers)
+    if response.status_code != 200:
+        raise RuntimeError(f"Gemini TTS API error (HTTP {response.status_code}): {_gemini_error_detail(response)}")
+    data = _read_tts_response_json(response, label="Gemini TTS")
+    try:
+        audio = data.get("output_audio") or next(
+            (content for step in reversed(data.get("steps", []))
+             for content in reversed(step.get("content", [])) if content.get("type") == "audio"),
+            {},
+        )
+        encoded = audio.get("data")
+        if not encoded:
+            raise RuntimeError("Gemini TTS returned empty audio data")
+        wav = base64.b64decode(encoded, validate=True)
+        if wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+            raise RuntimeError("Gemini TTS designed voice returned non-WAV audio")
+        return wav
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise RuntimeError(f"Gemini TTS audio response was malformed: {exc}") from exc
+
+
 def _generate_gemini_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     """Generate audio via Gemini ``generateContent`` (``responseModalities=["AUDIO"]``). The reply is
     base64 24kHz mono 16-bit PCM, wrapped as WAV and ffmpeg-converted to the requested container."""
@@ -600,6 +631,9 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: dict[str, Any]
             headers["X-Goog-Api-Client"] = f"hermes-agent/{get_version_info().base_version}"
         except Exception:
             headers["X-Goog-Api-Client"] = "hermes-agent/0.0.0"
+    if voice.startswith("voice_"):
+        wav = _request_gemini_designed_voice(prompt_text, model, voice, base_url, headers)
+        return _write_wav_bytes_as(wav, output_path)
     response = _post_json(f"{base_url}/models/{model}:generateContent", payload, headers)
     if response.status_code != 200:
         raise RuntimeError(f"Gemini TTS API error (HTTP {response.status_code}): {_gemini_error_detail(response)}")

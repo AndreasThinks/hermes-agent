@@ -724,7 +724,8 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
 async def get_session_messages(
     session_id: str, profile: Optional[str] = None, limit: Optional[int] = Query(None, ge=0),
     offset: int = Query(0, ge=0), order: Optional[str] = Query(None),
-    include_compacted: bool = Query(False), inline_images: bool = Query(True)):
+    include_compacted: bool = Query(False), inline_images: bool = Query(True),
+    include_audio: bool = Query(False)):
     if order not in (None, "oldest", "latest"):
         raise HTTPException(status_code=400, detail="order must be one of: oldest, latest")
 
@@ -744,14 +745,20 @@ async def get_session_messages(
         # prefetch only shows the child continuation's messages after a
         # compression rotation, hiding the pre-compaction transcript
         # (#51058).
-        return sid, _limit, db.get_messages(
+        messages = db.get_messages(
             sid, limit=_limit, offset=offset, latest=latest_page,
             include_compacted=include_compacted, include_ancestors=True)
+        from hermes_state_audio import message_audio, audio_messages
+        extra = audio_messages(db, sid, include_ancestors=True) if include_audio else []
+        attachments = message_audio(db, sid, [m["id"] for m in messages + extra], include_ancestors=True)
+        for message in messages + extra:
+            message["audio_attachments"] = attachments.get(message["id"], [])
+        return sid, _limit, messages, extra
 
     result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    sid, _limit, messages = result
+    sid, _limit, messages, extra = result
     projected_messages = await asyncio.to_thread(
         _project_for_display, messages, home=_history_profile_home(profile),
         inline_images=inline_images)
@@ -761,6 +768,8 @@ async def get_session_messages(
         # owner it already routes the session by.
         "profile": _serving_profile(profile),
         "messages": projected_messages,
+        "audio_messages": await asyncio.to_thread(
+            _project_for_display, extra, home=_history_profile_home(profile), inline_images=inline_images),
         "pagination": {
             "limit": _limit, "offset": offset,
             "order": order or ("latest" if limit is None else "oldest"),
@@ -971,3 +980,19 @@ async def prune_sessions_endpoint(body: SessionPrune):
         body = body.model_copy(update={
             "profile": destructive_profile(body.profile, "POST /api/sessions/prune")})
     return await asyncio.to_thread(_prune_sessions, body)
+
+
+@manage_router.get("/api/reply-audio/{audio_id}")
+async def get_reply_audio(audio_id: str, profile: Optional[str] = None):
+    """Uses the dashboard's normal /api authentication; never accepts filesystem paths."""
+    from fastapi.responses import FileResponse
+    from hermes_state_audio import audio_file, MIME
+
+    def read(db):
+        try:
+            return audio_file(db, audio_id)
+        except (ValueError, FileNotFoundError):
+            raise HTTPException(status_code=404, detail="Audio expired or unavailable")
+
+    path = await asyncio.to_thread(_with_db, profile, read, read_only=True)
+    return FileResponse(path, media_type=MIME[path.suffix], headers={"Cache-Control": "private, no-store"})
