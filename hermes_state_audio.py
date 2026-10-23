@@ -51,21 +51,28 @@ def _prune(db, conn, now):
             count += group["count"]
             continue
         key = (group["session_id"], group["message_id"])
-        for row in conn.execute("SELECT id FROM reply_audio WHERE session_id=? AND message_id=?", key):
-            _owned_path(db, row["id"]).unlink(missing_ok=True)
+        # Evict rows first. Files remain until a separate post-commit collection:
+        # rollback must never restore rows whose audio bytes were already deleted.
         conn.execute("DELETE FROM reply_audio WHERE session_id=? AND message_id=?", key)
-    # Recover only files created by this store if a process died between rename and commit.
-    root = _root(db)
-    if root.exists() and not root.is_symlink():
-        known = {r[0] for r in conn.execute("SELECT id FROM reply_audio")}
-        for path in root.iterdir():
-            if (_ID.fullmatch(path.name) and path.name not in known) or _PENDING.fullmatch(path.name):
-                path.unlink(missing_ok=True)
+
+
+def _collect_orphans(db):
+    def collect(conn):
+        # BEGIN IMMEDIATE serializes against other processes publishing files.
+        # Every row visible here was committed before this collection began.
+        root = _root(db)
+        if root.exists() and not root.is_symlink():
+            known = {r[0] for r in conn.execute("SELECT id FROM reply_audio")}
+            for path in root.iterdir():
+                if (_ID.fullmatch(path.name) and path.name not in known) or _PENDING.fullmatch(path.name):
+                    path.unlink(missing_ok=True)
+    db._execute_write(collect)
 
 
 def prune_audio(db, *, now=None):
     now = time.time() if now is None else now
     db._execute_write(lambda conn: _prune(db, conn, now))
+    _collect_orphans(db)
 
 
 def retain_audio(db, session_id, message_id, paths, *, now=None):
@@ -142,7 +149,9 @@ def retain_audio(db, session_id, message_id, paths, *, now=None):
                      "WHERE id IN (?, ?)", (published_at, session_id, tip_id))
         _prune(db, conn, now)
         return ids
-    return db._execute_write(write)
+    ids = db._execute_write(write)
+    _collect_orphans(db)
+    return ids
 
 
 def message_audio(db, session_id, message_ids, *, now=None, include_ancestors=False):
